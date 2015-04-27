@@ -3,8 +3,8 @@
 #
 # Program	: installer.sh
 # Author	: Jason Banham
-# Date		: 2013-01-04 | 2013-04-07
-# Version	: 0.10
+# Date		: 2013-01-04 | 2015-03-24
+# Version	: 0.18
 # Usage		: installer.sh [<zpool name>]
 # Purpose	: Gather performance statistics for a NexentaStor appliance
 # History	: 0.01 - Initial version
@@ -18,6 +18,16 @@
 #		  0.09 - Added test for NexentaStor 4 for arc_adjust*.d script
 #		  0.10 - Added an ignore/skip option to pool selection for when a data
 #		         pool has not yet been created
+#		  0.11 - Added logic in case installer.sh is not run from the same directory
+#			 where the tarball was unpacked
+#		  0.12 - Enhanced installer to pick multiple zpools/volumes to monitor
+#		  0.13 - Fixed bug in loop code for copying from payload directory
+#		  0.14 - Added an option to skip the auto-updater when calling sparta.sh
+#			 for customers who do not have a route out to the Internet
+#	   	  0.15 - Added in fsstat.sh for list of scripts to install
+#		  0.16 - Added in cifssvrtop.v4 specifically for NS4.x installations
+#		  0.17 - Added 5 scripts to help observer NexentaStor 4 transaction engine/throttling/vdev queue
+		  0.18 - Added cifs_taskq_watch.sh, cifs_threads.sh, nfsio_onehost.d scripts
 #
 
 #
@@ -60,7 +70,7 @@ SPARTA_TEMPLATE=$LOG_CONFIG/sparta.config.template
 #
 # Scripts and files to install
 #
-SCRIPTS="arcstat.pl arc_adjust.v2.d arc_adjust_ns4.v2.d arc_evict.d cifssvrtop dnlc_lookups.d iscsisvrtop kmem_reap_100ms.d large_delete.d txg_monitor.v3.d hotkernel.priv lockstat_sparta.sh metaslab.sh nfsio.d nfssrvutil.d nfssvrtop nfsrwtime.d sbd_zvol_unmap.d sparta.sh sparta_shield.sh stmf_task_time.d zil_commit_time.d zil_stat.d"
+SCRIPTS="arcstat.pl arc_adjust.v2.d arc_adjust_ns4.v2.d arc_evict.d cifssvrtop cifssvrtop.v4 delay_mintime.d delayed_writes.d dirty.d dnlc_lookups.d duration.d flame_stacks.sh fsstat.sh iscsisvrtop kmem_reap_100ms.d large_delete.d txg_monitor.v3.d hotkernel.priv lockstat_sparta.sh metaslab.sh nfsio.d nfssrvutil.d nfssvrtop nfsrwtime.d rwlatency.d sbd_zvol_unmap.d sparta.sh sparta_shield.sh stmf_task_time.d tcp_input.d zil_commit_time.d zil_stat.d openzfs_txg.d arc_meta.sh cifs_taskq_watch.sh cifs_threads.sh nfsio_onehost.d"
 CONFIG_FILES="sparta.config"
 TEMPLATE_FILES="README_WORKLOADS light"
 README="README"
@@ -102,9 +112,11 @@ $ECHO "Welcome to the performance monitoring script installer\n"
 if [ "x$1" == "x" ]; then
     ANS=""
     while [ `echo $ANS | wc -c` -lt 2 ]; do
+	let failcount=0
         $ECHO "Here are the available (non syspool) volumes (zpools) on this appliance:"
         $ZPOOL list | grep -v syspool
-        $ECHO "\nPlease enter the name of the volume (zpool) to monitor"
+        $ECHO "\nPlease enter the name(s) of the volume(s) (zpool) to monitor"
+        $ECHO "using commas to separate if multiple pools are specified"
 	$ECHO "or enter none if no data pool exists : \c "
         read ANS
 	if [ `echo $ANS | wc -c` -lt 2 ]; then
@@ -114,24 +126,35 @@ if [ "x$1" == "x" ]; then
 	    ZPOOL_NAME="syspool"		# Default to syspool so we have something
 	    break				# but likely to give unsatisfying results
 	fi
-        ZPOOL_EXIST="`$ZPOOL list -H $ANS > /dev/null 2>&1`"
-        if [ $? -ne 0 ]; then
-    	    $ECHO "Unable to find that volume ($ANS) - please try again."
-    	    ANS=""
-        else
+	IFS=", 	"
+	for poolname in $ANS
+	do
+            ZPOOL_EXIST="`$ZPOOL list -H $poolname > /dev/null 2>&1`"
+            if [ $? -ne 0 ]; then
+                $ECHO "Unable to find that volume ($poolname) - please try again.\n\n"
+                poolname=""
+                let failcount++
+            fi
+        done
+        unset IFS
+        if [ $failcount -eq 0 ]; then
 	    ZPOOL_NAME="$ANS"
-	    break
+            break
+        else
+	    ANS=""
+            continue
         fi
     done
 else
     ZPOOL_EXIST="`$ZPOOL list -H $1 > /dev/null 2>&1`"
     if [ $? -ne 0 ]; then
-	echo "Unable to find that volume ($ANS) - must exit but please check and re-run the installer."
+	$ECHO "Unable to find that volume ($ANS) - must exit but please check and re-run the installer."
 	exit 1
     fi
     ZPOOL_NAME="$1"
 fi
-echo "You have chosen to monitor the volume - $ZPOOL_NAME"
+$ECHO "You have chosen to monitor the volume - $ZPOOL_NAME"
+$ECHO ""
 
 SERVICE_ANS="n"
 $ECHO "Which service do you wish to monitor?"
@@ -176,6 +199,36 @@ if [ ! -d $LOG_TEMPLATES ]; then
     mkdir $LOG_TEMPLATES
 fi
 
+ 
+#
+# We expect people to unpack the tarball in /tmp and then cd into that directory
+# in order to install SPARTA, however that may not always be the case, so check
+# we can find the config file and prompt for the unpack location if not found.
+#
+UNPACK_DIR="."
+if [ ! -r payload/sparta.config ]; then
+    UNPACK_DIR=""
+    while [ `echo $UNPACK_DIR | wc -c` -lt 2 ]; do
+        $ECHO "I cannot find the scripts to install."
+        $ECHO "Please give the full path to where you unpacked the tarball, eg: /var/tmp"
+        $ECHO "Path name : \c"
+        read UNPACK_DIR
+        if [ `echo $UNPACK_DIR | wc -c` -lt 2 ]; then
+            continue;
+        fi
+        if [ ! -r ${UNPACK_DIR}/payload/sparta.config ]; then
+	    $ECHO "Oops, it doesn't look like SPARTA was unpacked there either, please try again.\n"
+   	    UNPACK_DIR=""
+	    continue
+	else
+	    $ECHO "thanks, I've found them now."
+            break
+        fi
+    done
+fi
+
+cd $UNPACK_DIR
+
 cp $README $LOG_DIR/
 
 for script in $SCRIPTS
@@ -219,9 +272,18 @@ $ECHO "\nWould you like me to run the performance gathering script? (y|n) \c"
 read RUNME
 RUNME="`$ECHO $RUNME | $TR '[:upper:]' '[:lower:]'`"
 if [ "$RUNME" == "y" ]; then
-    $LOG_SCRIPTS/sparta.sh start
+    $ECHO "SPARTA usually dials home in order to get the latest version"
+    $ECHO "Does this appliance have direct access to the Internet? (y|n) \c"
+    read INTERNET_ACCESS
+    INTERNET_ACCESS="`$ECHO $INTERNET_ACCESS | $TR '[:upper:]' '[:lower:]'`"
+    if [ "$INTERNET_ACCESS" == "y" ]; then
+        $LOG_SCRIPTS/sparta.sh start
+    else
+	$LOG_SCRIPTS/sparta.sh -u no start
+    fi
 fi
 
 $ECHO "\nTo run the script manually use - $LOG_SCRIPTS/sparta.sh start"
+$ECHO "To see the help page for SPARTA, run sparta.sh -h"
 
 exit 0

@@ -3,8 +3,8 @@
 #
 # Program	: sparta.sh
 # Author	: Jason.Banham@Nexenta.COM
-# Date		: 2013-02-04 - 2014-04-08
-# Version	: 0.32
+# Date		: 2013-02-04 - 2015-03-24
+# Version	: 0.56
 # Usage		: sparta.sh [ -h | -help | start | status | stop | tarball ]
 # Purpose	: Gather performance statistics for a NexentaStor appliance
 # Legal		: Copyright 2013 and 2014, Nexenta Systems, Inc. 
@@ -52,7 +52,34 @@
 #		  0.30 - Added additional comstar scripts
 #		  0.31 - Fixed NULL file logging problems
 #		  0.32 - Changed lockstat monitoring to be disabled by default
-#		  
+#		  0.33 - Added a zpool iostat monitor for Paul Nienabar
+#		  0.34 - Added LC_TIME into sparta.config to ensure correct date format for analysis tools
+#		  0.35 - Added visual feedback if we find a site specific .commands.local file
+#		  0.36 - sbd_zvol_unmap has disappeared from NS4.x so don't run the SBD_ZVOL_UNMAP script there
+#		  0.37 - Modified the SAMPLE_DAY variable to use hyphens instead of colons
+#		  0.38 - Added /etc/issue to list of files collected
+#		  0.39 - Fixed bugs in input filter (IFS) variable and selection of STMF monitoring
+#			 that were working but had come undone. (thanks to Dominic Watts @ NAS)
+#		  0.40 - Removed a redundant tunable from sparta.config (LOG_USED_MAX)
+#		  0.41 - Added filesystem statistic gathering
+#		  0.42 - Added a cifssvrtop.v4 script that works on NS4.x
+#		  0.43 - Added flamestack data collection for kernel and userland
+#		  0.44 - Now checks for sufficient free space in $LOG_DATASET (zpool) before starting
+#		  0.45 - nfsstat -s now runs continuously, as requested by Bayard
+#		  0.46 - Added ARC metadata monitoring
+#		  0.47 - Added monitoring of zpool TXG throughput, sync times, delays for NS4.x / OpenZFS
+#		  0.48 - Added R/W latency monitoring script for I/O operations
+#		  0.49 - Added OpenZFS write delay monitoring
+#		  0.50 - Disabled ARC meta data monitoring on NS3.x as values aren't exposed to kstat interface
+#		  0.51 - Added timestamp based data collection for zil_stat.d script
+#		  0.52 - Added the option to collect the uptime of the system
+#		  0.53 - Adjusted the kmem_reap_100ms.d script to include freemem, lotsfree, minfree, desfree and throttlefree values
+#		  0.54 - Added the 'space' command to sparta to show uncompressed space usage in the $LOG_DIR
+#		  0.55 - Added some smbstat monitoring for thread utilisation and iops statistics
+#			 Modified arcstat.pl for portability and to print date+time stamps (thanks Tony Nguyen)
+#			 We now also collect some log and misc files to assist analysis (see $OTHER_FILE_LIST)
+#		  0.56 - Fixed bug in OpenZFS TXG monitoring that sampled at the wrong time, leading to odd numbers
+#
 #
 
 # 
@@ -96,7 +123,7 @@ fi
 #
 function usage
 {
-    $ECHO "Usage: `basename $0` [-h] [-C|-I|-N|-S] [-p zpoolname] -u [ yes | no ] [-P protocol,protocol...] { start | stop | status | tarball | version }\n"
+    $ECHO "Usage: `basename $0` [-h] [-C|-I|-N|-S] [-p zpoolname] -u [ yes | no ] [-P {protocol,protocol... | all | none} ] { start | stop | status | tarball | version | space }\n"
 }
 
 #
@@ -118,16 +145,18 @@ function help
     $ECHO "    stop          : attempt to stop the dtrace scripts it started."
     $ECHO "    tarball       : generate a tarball of the performance data."
     $ECHO "    version       : display the version."
+    $ECHO "    space         : show uncompressed space usage in $LOG_DIR"
     $ECHO ""
     $ECHO "The following are valid optional arguments:\n"
     $ECHO "  -C              : Enable CIFS data collection (in addition to existing protocols)"
     $ECHO "  -I              : Enable iSCSI data collection (in addition to existing protocols)"
     $ECHO "  -N              : Enable NFS data collection (in addition to existing protocols)"
-    $ECHO "  -S		     : Enable STMF (COMSTAR) data collection (in addition to existing protocols)"
+    $ECHO "  -S              : Enable STMF (COMSTAR) data collection (in addition to existing protocols)"
     $ECHO "  -p <zpoolname>  : Monitor the given ZFS pool(s)"
     $ECHO "  -u [ yes | no ] : Enable or disable the automatic update feature"
     $ECHO "  -P <protocol>   : Enable *only* the given protocol(s) nfs iscsi cifs stmf or a combination"
     $ECHO "                    of multiple protocols, eg: -P nfs,cifs"
+    $ECHO "                    Also takes the options all or none to switch on all protocols, or collect none"
     $ECHO ""
     $ECHO "  -v              : display the version."
     $ECHO "  -help | -h | -? : display this help page.\n"
@@ -166,6 +195,8 @@ function script_status
     pgrep -fl "$IOSTAT $IOSTAT_OPTS"
     pgrep -fl "$PRSTAT $PRSTAT_OPTS"
     pgrep -fl "$SPARTA_SHIELD"
+    pgrep -fl "$ZPOOL iostat $ZPOOL_IOSTAT_OPTS"
+    pgrep -fl "$ARC_META"
 }
 
 
@@ -181,6 +212,8 @@ function script_kill
     pkill -f "$MPSTAT $MPSTAT_OPTS"
     pkill -f "$IOSTAT $IOSTAT_OPTS"
     pkill -f "$PRSTAT $PRSTAT_OPTS"
+    pkill -f "$ZPOOL iostat $ZPOOL_IOSTAT_OPTS"
+    pkill -f "$ARC_META"
 }
  
 
@@ -386,6 +419,38 @@ function calc_space()
 
 
 #
+# Check to see if a scrub is already in progress on any of the zpools
+# Notify the user as this can be a performance inhibitor
+#
+function check_for_scrub()
+{
+    for zpool_name in `zpool list -H | awk '{print $1}'`
+    do
+        if [ "`zpool status $zpool_name | awk '/scrub in progress/ {print $1}'`" == "scan:" ]; then
+	    $ECHO "    scrub running on $zpool_name"
+	fi
+    done
+}
+
+
+#
+# Can we actually startup SPARTA?  Is there sufficient free space in the logging directory?
+#
+function space_checker
+{
+    PERF_POOL="`$ECHO $LOG_DATASET | awk -F'/' '{print $1}'`"
+    POOL_CAPACITY="`$ZPOOL list -H -o capacity $PERF_POOL | awk -F'%' '{print $1}'`"
+    if [ $POOL_CAPACITY -gt $PERF_ZPOOL_CAPACITY_PERC ]; then
+        #
+        # What we prefix to the log file when writing
+        #
+	$ECHO "Unable to start SPARTA as $PERF_POOL capacity > ${PERF_ZPOOL_CAPACITY_PERC}%"
+	exit 1
+    fi
+}
+
+
+#
 # Generate a tarball of the perflogs directory
 #   arg1 = whether we wish to bypass the 'Do you wish to ...' question as this can be
 #          rather annoying when asked previously at the end of a sparta run
@@ -473,7 +538,7 @@ function generate_tarball
 #
 subcommand="usage"
 
-while getopts ChINP:u:vp:? argopt
+while getopts ChINP:Su:vp:? argopt
 do
         case $argopt in
         C)      # Enable CIFS scripts
@@ -495,7 +560,7 @@ do
 		TRACE_NFS="n"
 		TRACE_STMF="n"
 
-    		IFS=",  ^M"
+    		IFS=", 	"
 		for protocol in $OPTARG
 		do
 		    case $protocol in
@@ -550,6 +615,11 @@ subcommand="$1"
 # Check for a supplied command and act appropriately
 #
 case "$subcommand" in
+    space )
+	SPACE_USED=`calc_space $LOG_DIR`
+        echo "You are using `expr $SPACE_USED / $MEGABYTE` MB (uncompressed) in the $LOG_DIR directory for performance data." 
+	exit 0
+	;;
     start )
 	# Break out of this case statement and into the main body of code
 	;;
@@ -584,6 +654,14 @@ case "$subcommand" in
 	exit 0
 	;;
 esac
+
+
+#
+# Check we actually have sufficient free space to startup SPARTA
+#
+space_checker
+
+
 
 ################################################################################
 # 
@@ -761,6 +839,32 @@ function gather_kernel_mdb
     done
 }
 
+function gather_flame_stacks
+{
+    print_to_log "Collecting kernel/user stacks" $SPARTA_LOG $FF_DATE
+    print_to_log "  Starting kernel stack collection" $SPARTA_LOG $FF_DATE
+    $FLAME_STACKS -k > $LOG_DIR/$SAMPLE_DAY/flame_kernel_stacks.out 2>&1 &
+    $ECHO ". \c"
+    let count=0
+    while [ $count -lt $FLAME_STACKS_SAMPLE_TIME ]; do
+        cursor_update
+        sleep 1
+        let count=$count+1
+    done
+    cursor_blank
+
+    print_to_log "  Starting userland stack collection" $SPARTA_LOG $FF_DATE
+    $FLAME_STACKS -k > $LOG_DIR/$SAMPLE_DAY/flame_user_stacks.out 2>&1 &
+    $ECHO ". \c"
+    let count=0
+    while [ $count -lt $FLAME_STACKS_SAMPLE_TIME ]; do
+        cursor_update
+        sleep 1
+        let count=$count+1
+    done
+    cursor_blank
+}
+
 
 ### Network specific tool section
 
@@ -798,7 +902,7 @@ function gather_dladm
 
 function launch_txg_monitor
 {
-    IFS=",  ^M"
+    IFS=", 	"
     for poolname in $ZPOOL_NAME
     do
         PGREP_STRING="$TXG_MON $poolname"
@@ -814,9 +918,27 @@ function launch_txg_monitor
     unset IFS
 }
 
+function launch_openzfs_txg_monitor
+{
+    IFS=", 	"
+    for poolname in $ZPOOL_NAME
+    do
+        PGREP_STRING="$TXG_MON $poolname"
+        OPENZFS_TXG_MON_PID="`pgrep -fl "$PGREP_STRING" | awk '{print $1}'`"
+        if [ "x$OPENZFS_TXG_MON_PID" == "x" ]; then
+            print_to_log "$OPENZFS_TXG_MON on zpool $poolname" $LOG_DIR/$SAMPLE_DAY/zpool_open_${poolname}.out $FF_DATE_SEP
+            $OPENZFS_TXG_MON $poolname >> $LOG_DIR/$SAMPLE_DAY/zpool_open_${poolname}.out 2>&1 &
+            print_to_log "  Started OpenZFS txg_monitoring on $poolname" $SPARTA_LOG $FF_DATE
+        else
+            print_to_log "  OpenZFS txg_monitor already running for zpool $poolname as PID $OPENZFS_TXG_MON_PID" $SPARTA_LOG $FF_DATE
+        fi
+    done
+    unset IFS
+}
+
 function launch_metaslab
 {
-    IFS=",  ^M"
+    IFS=", 	"
     for poolname in $ZPOOL_NAME
     do
         PGREP_STRING="$METASLAB_ALLOC -p $poolname"
@@ -841,6 +963,18 @@ function launch_arc_adjust
         print_to_log "  Started ARC adjust monitoring" $SPARTA_LOG $FF_DATE
     else
         print_to_log "  arc_adjust already running as PID $ARC_ADJUST_PID" $SPARTA_LOG $FF_DATE
+    fi
+}
+
+function launch_arc_meta
+{
+    ARC_META_PID="`pgrep -fl $ARC_META | awk '{print $1}'`"
+    if [ "x$ARC_META_PID" == "x" ]; then
+        print_to_log "ARC meta usage" $LOG_DIR/$SAMPLE_DAY/arc_meta.out $FF_DATE_SEP
+        $ARC_META >> $LOG_DIR/$SAMPLE_DAY/arc_meta.out 2>&1 &
+        print_to_log "  Started ARC metadata monitoring" $SPARTA_LOG $FF_DATE
+    else
+        print_to_log "  arc_meta.sh already running as PID $ARC_META_PID" $SPARTA_LOG $FF_DATE
     fi
 }
 
@@ -872,8 +1006,8 @@ function launch_zil_commit
 {
     ZIL_COMMIT_TIME_PID="`pgrep -fl $ZIL_COMMIT_TIME | awk '{print $1}'`"
     if [ "x$ZIL_COMMIT_TIME_PID" == "x" ]; then
-        print_to_log "zil commit time" $LOG_DIR/$SAMPLE_DAY/zil_commit_time.out $FF_DATE_SEP
-        $ZIL_COMMIT_TIME >> $LOG_DIR/$SAMPLE_DAY/zil_commit_time.out 2>&1 &
+        print_to_log "zil commit time" $LOG_DIR/$SAMPLE_DAY/zil_commit.out $FF_DATE_SEP
+        $ZIL_COMMIT_TIME >> $LOG_DIR/$SAMPLE_DAY/zil_commit.out 2>&1 &
         print_to_log "  Started zil commit time sampling" $SPARTA_LOG $FF_DATE
     else
         print_to_log "  zil commit time script already running as PID $ZIL_COMMIT_TIME_PID" $SPARTA_LOG $FF_DATE
@@ -884,8 +1018,8 @@ function launch_zil_stat
 {
     ZIL_STAT_PID="`pgrep -fl zil_stat\.d | awk '{print $1}'`"
     if [ "x$ZIL_STAT_PID" == "x" ]; then
-        print_to_log "zil statistics" $LOG_DIR/$SAMPLE_DAY/zil_stat.out $FF_DATE_SEP
-        $ZIL_STAT >> $LOG_DIR/$SAMPLE_DAY/zil_stat.out 2>&1 &
+        print_to_log "zil statistics" $LOG_DIR/$SAMPLE_DAY/zilstat.out $FF_DATE_SEP
+        $ZIL_STAT $ZIL_STAT_OPTS >> $LOG_DIR/$SAMPLE_DAY/zilstat.out 2>&1 &
         print_to_log "  Started zil statistics sampling" $SPARTA_LOG $FF_DATE
     else
         print_to_log "  zil statistics script already running as PID $ZIL_STAT_PID" $SPARTA_LOG $FF_DATE
@@ -919,7 +1053,7 @@ function gather_zpool_list
 
 function gather_zfs_get
 {
-    IFS=",  ^M"
+    IFS=", 	"
     for poolname in $ZPOOL_NAME
     do
         $ZFS get -r all $poolname >> $LOG_DIR/$SAMPLE_DAY/zfs_get-r_all.${poolname}.out 2>&1
@@ -936,6 +1070,48 @@ function launch_large_file_delete
         print_to_log "  Started monitoring of large deletes" $SPARTA_LOG $FF_DATE
     else
         print_to_log "  large delete script already running as PID $LARGE_DELETE_PID" $SPARTA_LOG $FF_DATE
+    fi
+}
+
+function gather_zpool_iostat
+{
+    IFS=", 	"
+    for poolname in $ZPOOL_NAME
+    do
+        PGREP_STRING="$ZPOOL iostat $ZPOOL_IOSTAT_OPTS $poolname $ZPOOL_IOSTAT_FREQ"
+        ZPOOL_IOSTAT_PID="`pgrep -fl "$PGREP_STRING" | awk '{print $1}'`"
+        if [ "x$ZPOOL_IOSTAT_PID" == "x" ]; then
+            print_to_log "$ZPOOL iostat on zpool $poolname" $LOG_DIR/$SAMPLE_DAY/zpool_iostat_${poolname}.out $FF_DATE_SEP
+            $ZPOOL iostat $ZPOOL_IOSTAT_OPTS $poolname $ZPOOL_IOSTAT_FREQ >> $LOG_DIR/$SAMPLE_DAY/zpool_iostat_${poolname}.out 2>&1 &
+            print_to_log "Started zpool iostat $ZPOOL_IOSTAT_OPTS $poolname $ZPOOL_IOSTAT_FREQ" $SPARTA_LOG $FF_DATE
+        else
+            print_to_log "zpool iostat already running for zpool $poolname as PID $ZPOOL_IOSTAT_PID" $SPARTA_LOG $FF_DATE
+        fi
+    done
+    unset IFS
+}
+
+function launch_rwlatency
+{
+    RWLATENCY_PID="`pgrep -fl $RWLATENCY | awk '{print $1}'`"
+    if [ "x$RWLATENCY_PID" == "x" ]; then
+        print_to_log "R/W latency sampling" $LOG_DIR/$SAMPLE_DAY/rwlatency.out $FF_DATE_SEP
+	$RWLATENCY >> $LOG_DIR/$SAMPLE_DAY/rwlatency.out 2>&1 &
+	print_to_log "  Started R/W latency sampling" $SPARTA_LOG $FF_DATE
+    else
+	print_to_log "  R/W latency monitoring is already running as PID $RWLATENCY_PID" $SPARTA_LOG $FF_DATE
+    fi
+}
+
+function launch_delay_mintime
+{
+    DELAY_MINTIME_PID="`pgrep -fl $DELAY_MINTIME | awk '{print $1}'`"
+    if [ "x$DELAY_MINTIME_PID" == "x" ]; then
+        print_to_log "OpenZFS write delay sampling" $LOG_DIR/$SAMPLE_DAY/delay_mintime.out $FF_DATE_SEP
+	$DELAY_MINTIME >> $LOG_DIR/$SAMPLE_DAY/delay_mintime.out 2>&1 &
+	print_to_log "  Started OpenZFS write delay sampling" $SPARTA_LOG $FF_DATE
+    else
+	print_to_log "  OpenZFS write delay monitoring is already running as PID $DELAY_MINTIME_PID" $SPARTA_LOG $FF_DATE
     fi
 }
 
@@ -966,6 +1142,12 @@ function gather_memstat
     done
 }
 
+function gather_uptime
+{
+    print_to_log "  uptime statistics" $SPARTA_LOG $FF_DATE
+    $UPTIME > $LOG_DIR/$SAMPLE_DAY/uptime.out
+}
+
 
 ## Disk specific functions defined here
 
@@ -986,6 +1168,22 @@ function gather_iostat
 {
     print_to_log "  getting disk error count (iostat -E)" $SPARTA_LOG $FF_DATE
     $IOSTAT $IOSTAT_INFO_OPTS >> $LOG_DIR/$SAMPLE_DAY/iostat-En.out
+}
+
+
+### Filesystems specific functions defined here
+
+function gather_fsstat
+{
+    print_to_log "Filesystem statistics" $SPARTA_LOG $FF_DATE
+    $FSSTAT_SH $FSSTAT_OPTS >> $LOG_DIR/$SAMPLE_DAY/fsstat.out &
+    let count=0
+    while [ $count -lt $FSSTAT_SAMPLE_TIME ]; do
+        cursor_update
+        sleep 1
+        let count=$count+1
+    done
+    cursor_blank
 }
 
 
@@ -1042,14 +1240,11 @@ function launch_nfs_rwtime
 
 function gather_nfs_stat_server
 {
-    for x in {1..3}
-    do
-        print_to_log "  nfsstat -s statistics - sample ${x}" $SPARTA_LOG $FF_DATE
-        print_to_log "nfsstat -s sample ${x}" $LOG_DIR/$SAMPLE_DAY/nfsstat-s.out $FF_DATE_SEP
-        $NFSSTAT $NFSSTAT_OPTS >> $LOG_DIR/$SAMPLE_DAY/nfsstat-s.out
-        $ECHO ".\c"
-        cursor_pause 5
-    done
+    print_to_log "  nfsstat -s" $SPARTA_LOG $FF_DATE
+    print_to_log "nfsstat -s" $LOG_DIR/$SAMPLE_DAY/nfsstat-s.out $FF_DATE_SEP
+    $NFSSTAT $NFSSTAT_OPTS >> $LOG_DIR/$SAMPLE_DAY/nfsstat-s.out 2>&1 & 2>&1 &
+    $ECHO ".\c"
+    cursor_pause 5
 }
 
 function gather_nfs_share_output
@@ -1135,6 +1330,22 @@ function gather_cifs_share_output
     $SHARECTL get smb > $LOG_DIR/$SAMPLE_DAY/sharectl_get_smb.out
 }
 
+function launch_cifs_util
+{
+    $PGREP -fl "$SMBSTAT $SMB_UTIL_OPTS" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	$SMBSTAT $SMB_UTIL_OPTS >> $LOG_DIR/$SAMPLE_DAY/{$1} 2>&1 &
+    fi
+}
+
+function launch_cifs_ops
+{
+    $PGREP -fl "$SMBSTAT $SMB_OPS_OPTS" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	$SMBSTAT $SMB_OPS_OPTS >> $LOG_DIR/$SAMPLE_DAY/{$1} 2>&1 &
+    fi
+}
+
 
 
 
@@ -1182,9 +1393,20 @@ fi
 
 
 #
+# Check for any running scrubs
+#
+$ECHO "Checking for active scrubs on imported zpools"
+$ECHO "Please NOTE: scrubs can have an impact on zpool performance, affecting latency and throughput"
+$ECHO ""
+check_for_scrub
+$ECHO ""
+$ECHO ""
+
+
+#
 # Performance samples are collated by day (where possible) so figure out the day
 #
-SAMPLE_DAY="`$DATE +%Y:%m:%d`"
+SAMPLE_DAY="`$DATE +%Y-%m-%d`"
 if [ ! -d $LOG_DIR/$SAMPLE_DAY ]; then
     $MKDIR -p $LOG_DIR/$SAMPLE_DAY
     if [ $? -ne 0 ]; then
@@ -1199,16 +1421,27 @@ fi
 
 
 #
-# Collect the defined configuration files of interest
+# Collect the defined configuration and other files of interest
 #
 
-$ECHO "Collecting configuration files ... \c"
+$ECHO "Collecting configuration and other files of interest ... \c"
 print_to_log "#############################" $SPARTA_LOG $FF_NEWL
 
 print_to_log "Collecting configuration files first" $SPARTA_LOG $FF_DATE
 for config_file in ${CONFIG_FILE_LIST}
 do
     $CP $config_file $LOG_DIR/
+done
+
+FILE_LIMIT="`expr $MEGABYTE \* 50`"
+for other_file in ${OTHER_FILE_LIST}
+do
+    FILESIZE="`$STAT -c%s $other_file`"
+    if [ $FILESIZE -lt $FILE_LIMIT ]; then
+	$CP $other_file $LOG_DIR/
+    else
+        $ECHO "File exceeded $FILE_LIMIT - did not collect" > $LOG_DIR/`basename $other_file`
+    fi
 done
 $ECHO "done"
 
@@ -1280,6 +1513,22 @@ do
     if [ ${DISK_ENABLE_LIST[$item]} -eq 1 ]; then
         do_log ${DISK_NAME_LIST[$item]}
 	${DISK_COMMAND_LIST[$item]} ${DISK_NAME_LIST[$item]}
+        $ECHO ".\c"
+    fi
+done
+$ECHO " done"
+
+
+#
+# Filesystem specific scripts invoked here
+#
+$ECHO "Starting Filesystem statistics gathering .\c"
+array_limit=$(expr ${#FILESYS_ENABLE_LIST[@]} - 1)
+for item in `seq 0 $array_limit`
+do
+    if [ ${FILESYS_ENABLE_LIST[$item]} -eq 1 ]; then
+        do_log ${FILESYS_NAME_LIST[$item]}
+        ${FILESYS_COMMAND_LIST[$item]} ${FILESYS_NAME_LIST[$item]}
         $ECHO ".\c"
     fi
 done
